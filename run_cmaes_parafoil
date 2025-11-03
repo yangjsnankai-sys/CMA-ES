@@ -1,0 +1,141 @@
+function run_cmaes_parafoil()
+%% ======================== CMA-ES Optimization for Parafoil Landing Height (Parallel/Vectorized) ========================
+% Model: parafoil_CMA.slx / System name: parafoil_CMA
+% Tunable variable: height_action
+% Evaluation metric: episodeReward (only this metric; no error fallback)
+% Objective direction: Maximize episodeReward (negative inside objective function)
+
+%% --------- Global and CMA-ES Configuration ---------
+GLOBAL_SEED = 20251002;     % Fixed random seed
+model       = 'parafoil_CMA';
+mdl_path    = 'D:\program\finalprogram\跟圆走直线\suanfa_2.1\parafoil_CMA.slx';  % Modify if path differs
+Tf          = 500;
+STEP        = 0.2; LB = 3.0; UB = 20.0;
+N_REPEAT    = 5;            % Number of repetitions per candidate (suggested 3~5)
+
+x0 = 12.0;                  % CMA-ES initial guess
+sigma0 = (UB-LB)/4;
+opts = struct();
+opts.LBounds      = LB;
+opts.UBounds      = UB;
+opts.PopSize      = 12;     % λ
+opts.MaxFunEvals  = 200;
+opts.StopFitness  = [];     % Can set threshold if needed
+opts.DispModulo   = 1;
+opts.DispFinal    = 'on';
+opts.Vectorized   = 'on';   % ★ Key: batch evaluation per generation
+opts.EvalParallel = 1;
+
+%% --------- Open Model & Parallel Pool & Worker Environment ---------
+if ~bdIsLoaded(model), load_system(model); end
+open_system(mdl_path);                  % Open model for visualization
+p = gcp('nocreate'); if isempty(p), parpool('local'); p = gcp('nocreate'); end
+fprintf('[INFO] Parallel pool ready: workers = %d\n', p.NumWorkers);
+
+tStart = tic;
+% Fix random streams: main/workers; disable multithreaded BLAS
+rng(GLOBAL_SEED,'twister');
+pctRunOnAll( ...
+  "try, s=RandStream('Threefry','Seed'," + GLOBAL_SEED + "+labindex);" + ...
+  "RandStream.setGlobalStream(s); maxNumCompThreads(1); end");
+
+% Each worker has independent cache/code generation directory (avoid .slxc conflicts), preload model
+pctRunOnAll( ...
+    "cf=tempname; gf=tempname;" + ...
+    "Simulink.fileGenControl('set','CacheFolder',cf,'CodeGenFolder',gf,'createDir',true);" + ...
+    "try, load_system('" + model + "'); end;" + ...
+    "warning('off','Simulink:cache:CacheFileWriteError');" ...
+);
+
+% Disable FastRestart (more stable when modifying Integrator initial values)
+set_param(model,'FastRestart','off');
+
+% Collect Integrator blocks (if need to override IC)
+icBlocks = find_system(model,'BlockType','Integrator');
+fprintf('[INFO] Number of Integrators found: %d\n', numel(icBlocks));
+
+% Pass context (for wrapper use)
+ctx.model    = model;
+ctx.Tf       = Tf;
+ctx.step     = STEP;
+ctx.lb       = LB;
+ctx.ub       = UB;
+ctx.nrepeat  = N_REPEAT;
+ctx.icBlocks = icBlocks;
+ctx.seedR    = GLOBAL_SEED;
+
+%% --------- Execute CMA-ES (Objective function: objective_parafoil_height_wrapper.m) ---------
+fprintf('CMA-ES optimization is beginning...\n');
+[xmin, fmin, counteval, stopflag, out, bestever] = cmaes( ...
+    'objective_parafoil_height_wrapper', x0, sigma0, opts, ctx); %#ok<ASGLU>
+
+best_h = quantize_and_clip(xmin, STEP, LB, UB);
+
+fprintf('\n=========== CMA-ES Results ===========\n');
+fprintf('Optimal landing trigger height h* = %.2f m\n', best_h);
+fprintf('Objective function minimum     f* = %.6f\n', fmin);
+disp(stopflag);
+
+%% --------- Single Run: Programmatic Simulation (Display results in Simulink interface) ---------
+% Model already opened earlier; use SimulationInput for single simulation
+simIn = Simulink.SimulationInput(model);
+simIn = simIn.setVariable('height_action', best_h);
+simIn = simIn.setVariable('seedR', ctx.seedR);   % If model random blocks use seedR
+simIn = simIn.setModelParameter('StopTime', num2str(Tf), ...
+                                'SignalLogging','on', 'SignalLoggingName','logsout');
+
+% Override Integrator initial values (if model needs fixed IC; modify with your actual values)
+icStr = '[1500 1500 500 0 0 -pi 0 0 10 0 5 0 0 0 10 0 5 0 0 0 0 0]';
+for b = 1:numel(icBlocks)
+    simIn = simIn.setBlockParameter(icBlocks{b}, 'InitialCondition', icStr);
+end
+
+simOut = sim(simIn);  % NOTE: Model is open, Scope/Display will show real-time results
+
+% Read only episodeReward (no error fallback)
+R = get_episode_reward(simOut);
+fprintf('episodeReward = %.6f\n', R);
+
+%% --------- Save Results (avoid polluting Base workspace, easy to reproduce) ---------
+res.simout        = simOut;
+res.best_h        = best_h;
+res.best_reward   = R;      % Positive reward (larger is better)
+res.fbest         = fmin;   % Objective function minimum (smaller is better)
+
+save('cma_out1.mat','res');
+
+fprintf('\n[TIME] Total elapsed time: %.1f s\n', toc(tStart));
+end  % ===== End of main function =====
+
+
+%% ======================= Utility functions used only for final validation =======================
+function hq = quantize_and_clip(x, step, lb, ub)
+    x = x(1);
+    xq = lb + round((x - lb)/step)*step;
+    hq = min(max(xq, lb), ub);
+end
+
+function r = get_episode_reward(simOut)
+    % Read only episodeReward; throw error if read fails
+    ok = false; r = NaN;
+    try
+        ws = simOut.who;
+        if any(strcmp(ws,'episodeReward'))
+            v = simOut.get('episodeReward');
+            if isa(v,'timeseries'), v = v.Data(end); end
+            r = v; ok = isfinite(r);
+        end
+    catch, end
+    if ~ok
+        try
+            ds = simOut.logsout;
+            if ~isempty(ds)
+                el = ds.get('episodeReward');
+                v = el.Values; r = v.Data(end); ok = isfinite(r);
+            end
+        catch, end
+    end
+    if ~ok
+        error('Failed to read episodeReward from simulation results. Please check model signal logging settings.');
+    end
+end
