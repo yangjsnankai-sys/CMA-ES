@@ -1,0 +1,95 @@
+function f = objective_parafoil_height_wrapper(X, ctx)
+% Vectorized + internal parallel (parfor): X is [n x lambda] or [lambda x 1]
+% Objective: minimize f = -episodeReward (use only episodeReward, no error fallback)
+
+    if isvector(X), X = X(:)'; end
+    lambda = size(X,2);
+    f = NaN(1, lambda);
+
+    % Allow IC/parameter changes: disable Fast Restart (ensure effective on workers)
+    try, set_param(ctx.model,'FastRestart','off'); end
+
+    % parfor internally evaluates each candidate j independently
+    parfor j = 1:lambda
+        f(j) = eval_one_sample(X(:,j), ctx);
+    end
+end
+
+% ================== Subfunction: Evaluate single candidate ==================
+function fj = eval_one_sample(xcol, ctx)
+    % Quantize/clip to allowed range
+    h = quantize_and_clip(xcol(1), ctx.step, ctx.lb, ctx.ub);
+
+    % Multiple repetitions (noise reduction): use only episodeReward
+    vals = NaN(ctx.nrepeat,1);
+    for k = 1:ctx.nrepeat
+        % ---- Construct simulation input (only modify tunable variables and necessary block parameters) ----
+        simIn = Simulink.SimulationInput(ctx.model);
+        simIn = simIn.setVariable('height_action', h);
+        if isfield(ctx,'seedR') && ~isempty(ctx.seedR)
+            simIn = simIn.setVariable('seedR', ctx.seedR);   % If model random blocks use seedR
+        end
+        simIn = simIn.setModelParameter('StopTime', num2str(ctx.Tf), ...
+                                        'SignalLogging','on', ...
+                                        'SignalLoggingName','logsout');
+
+        % ---- Override Integrator initial values (if model needs fixed IC) ----
+        if isfield(ctx,'icBlocks') && ~isempty(ctx.icBlocks)
+            icStr = '[1500 1500 500 0 0 -pi 0 0 10 0 5 0 0 0 10 0 5 0 0 0 0 0]';
+            for b = 1:numel(ctx.icBlocks)
+                simIn = simIn.setBlockParameter(ctx.icBlocks{b}, 'InitialCondition', icStr);
+            end
+        end
+
+        % ---- Run simulation ----
+        try
+            simOut = sim(simIn, 'ShowProgress','off');
+            % Read only episodeReward; throw to catch if cannot read
+            R = get_episode_reward(simOut);
+            vals(k) = -R;  % Maximize reward → minimize -reward
+        catch
+            % Simulation failed or cannot read episodeReward: assign large penalty
+            vals(k) = 1e9;
+        end
+    end
+
+    % —— Aggregation: median is more robust to noise —— 
+    fj = median(vals,'omitnan');
+    if ~isfinite(fj), fj = 1e9; end
+end
+
+% ================== Utility functions (keep local to avoid worker issues) ==================
+function hq = quantize_and_clip(x, step, lb, ub)
+    x = x(1);
+    xq = lb + round((x - lb)/step)*step;
+    hq = min(max(xq, lb), ub);
+end
+
+function r = get_episode_reward(simOut)
+% Read only episodeReward; throw error if read fails (no error fallback)
+    ok = false; r = NaN;
+    % To Workspace variables
+    try
+        ws = simOut.who;
+        if any(strcmp(ws,'episodeReward'))
+            v = simOut.get('episodeReward');
+            if isa(v,'timeseries'), v = v.Data(end); end
+            r = v; ok = isfinite(r);
+        end
+    catch, end
+    % logsout Dataset
+    if ~ok
+        try
+            ds = simOut.logsout;
+            if ~isempty(ds)
+                el = ds.get('episodeReward');
+                v = el.Values; 
+                if isa(v,'timeseries'), v = v.Data(end); end
+                r = v; ok = isfinite(r);
+            end
+        catch, end
+    end
+    if ~ok
+        error('Failed to read episodeReward from simulation results. Please check model signal logging settings (To Workspace or logsout).');
+    end
+end
